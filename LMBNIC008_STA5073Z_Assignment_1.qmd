@@ -1,0 +1,678 @@
+---
+title: "STA5073Z - Recommender Systems"
+author: "Nicholas A Limbert"
+format:
+  pdf: default
+  html: default
+editor: visual
+bibliography: references.bib
+---
+
+## Introduction
+
+Recommender systems have become an important part of modern digital platforms, enhancing user experience by delivering personalized suggestions for items such as books, movies, products, and more. The increasing volume of data and platforms available today has made it essential for companies to provide comprehensive and tailored views to users in order to improve user engagement and satisfaction. We will focus on the development of an ensemble recommender system designed to suggest books to new and current users based on their past ratings and similarities to other users.
+
+The analysis will utilize a dataset from the Book-Crossing [@arashnic_book_recommendation_dataset] community, which includes over 1.1 million ratings from approximately 279,000 users for more than 271,000 books.
+
+We aim to implement three distinct recommendation methodologies: item-based collaborative filtering, user-based collaborative filtering, and matrix factorization techniques. Subsequently, an ensemble recommender system that incorporates predication's from all three implementations will be constructed to provide a more tailored model. By evaluating these approaches individually and then combining their predictions into an ensemble model, we seek to improve the accuracy of the book recommendations.
+
+At each step we will asses the accuracy of the models. Additional steps such such as k-fold cross-validation will be used to asses matrix factorization. To prevent over fitting, we incorporate regularization into matrix factorization model to help balance the model complexity and generalization.
+
+Prior to model building, basic exploratory data analysis (EDA) is performed to unpack and understand the structure of the data set. This guides the preprocessing steps, for handling missing values, normalizing ratings, and structuring the data. for optimal performance in matrix factorization. Effective preprocessing ensures clean and usable data and ultimately contributing to better model outcomes.
+
+## Data Preprocessing and Features
+
+After inspecting the structure of the datasets, a left join merge operation was performed to combine user and book metadata to the ratings records. This merging was crucial for constructing a comprehensive user-item interaction matrix that includes additional information about users and book. Implicit ratings, represented by zero values, were removed to ensure that only explicit ratings were considered. Implciity ratings for recomdeations would hold no value as we can only gauge interest from this measure as no feedback from is received from the users. Additionally, records with missing book titles were excluded from the data set as these are assumed to be invalid ISBN numbers captured in the ratings table.
+
+To reduce the data set size for more efficient processing, two key filters were applied:
+
+-   Users with fewer than three ratings were excluded, leaving only the most active users. This leaves only the most active users and provides more substantial information to train the models.
+
+-   Books with fewer than ten ratings were excluded, ensuring that only the most popular books, which have enough data to make meaningful predictions are included in the data set
+
+This approach helps eliminate noise from inactive users and unpopular books.
+
+Finally, the data set is transformed into a user-item matrix, where rows represented users, columns represented books, and the matrix cells contained the corresponding book ratings. Missing values (where a user had not rated a specific book) were replaced with zeroes, as they represent no interaction between the user and the book.
+
+*Due to performance issues the data set was reduced significantly by further filtering out user rows and book columns with fewer than 10 ratings. This mitigates the impact of sparsity in the data set, ensuring that the recommendations are based on sufficient interaction data. However, it must be noted that we will lose diversity in recommendations, introduce bias from only active users and likely introduce the cold start problem where new users or books that don't meet the threshold won't be included.*
+
+```{r, echo= FALSE}
+#| echo: false
+#| warning: false
+#| message: false
+
+# Import require libraries (install if they don't exists)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(tibble)
+library(knitr)
+library(ggplot2)
+library(dplyr)
+library(DT)
+library(keras)
+library(data.table)
+library(caret)
+library(Matrix)
+library(readr)
+library(lsa)
+library(recosystem)  # matrix factorization
+
+# Import data sets
+working_dir <- getwd()
+users <- read.csv("./data/users.csv", header = TRUE, sep = ',', na.strings = "NA")
+ratings <- read.csv("./data/ratings.csv", header = TRUE, sep = ',', na.strings = "NA")
+books <- read.csv("./data/books.csv", header = TRUE, sep = ',', na.strings = "NA")
+
+
+book_info <- books %>%
+    select(ISBN, Book.Title) %>%  # Select only ISBN and Book Title
+    filter(!is.na(Book.Title))
+
+# See simple structure of dataset
+#str(users)
+#str(ratings)
+#str(books)
+
+# Join required fields and save useful data set
+ratings_users <- left_join(ratings, users, by = "User.ID") # add users info to ratings
+ratings_users <- left_join(ratings_users, books, by = "ISBN") #add book infor to ratings with user infor
+
+# Locations are useless at such detail, include only countries for now
+#Upon inspecting location data there are many incomplete capture and will hold no value in our analysis
+#ratings_users$Country <- str_extract(ratings_users$Location, "[^,]+$")
+#print(unique(ratings_users$Country))
+
+# This step allows us to select of fields we want to keep before saving (adjust if needed)
+# This step also removes where no book title is available and rating is implicit
+ratings_users <- ratings_users %>%
+  filter(!is.na(Book.Title)) %>% 
+  filter(Book.Rating != 0) %>% #remove implicit ratings as they only show interest
+  select(User.ID, ISBN, Book.Rating, Age, Book.Title, Book.Author, Year.Of.Publication) %>% 
+  arrange(User.ID, ISBN, Book.Rating) #order by userid also 
+
+# Save data set for working with and remove all other imports to free up workspace
+save(ratings_users, file = "data/ratings_users.RData")
+rm(books, ratings, ratings_users, users, working_dir)
+load("data/ratings_users.RData")
+
+# Working with data
+ratings_users <- as_tibble(ratings_users) #Convert to Tibble
+
+# Only use what we need for now
+ratings_users <- ratings_users %>%
+  select(User.ID, ISBN, Book.Rating, Book.Title)
+
+# Reduce dataset size (user have 3 or more ratings) 5444 have more than 3 ratings 
+top_users <- ratings_users %>%
+  group_by(User.ID) %>%
+  summarise(rating_count = n()) %>%
+  filter(rating_count >= 3 ) %>%
+  pull(User.ID)
+
+# Reduce dataset size (books have 10 or more ratings) 20194 have more than 20 ratings
+top_books <- ratings_users %>%
+  group_by(ISBN) %>%
+  summarise(rating_count = n()) %>%
+  filter(rating_count >= 10) %>%
+  pull(ISBN)
+
+#reduce data set to only those we need
+data_reduced <- ratings_users %>%
+  filter(User.ID %in% top_users, ISBN %in% top_books)
+
+save(data_reduced, file = "data/reduced.RData")
+
+#remove stuff not needed
+#rm(ratings_users, top_books, top_users)
+
+#Create a user-item matrix
+rating_matrix <- data_reduced %>%
+  select(User.ID, ISBN, Book.Rating) %>%
+  pivot_wider(names_from = ISBN, values_from = Book.Rating) %>%
+  as.matrix()
+
+save(rating_matrix, file = "data/matrix.RData")
+#load("data/matrix.RData")
+
+#rating_matrix <- as.data.frame(rating_matrix)  #ensure it's a data frame
+#rownames(rating_matrix) <- rating_matrix$User.ID  #assign User.ID as row names
+#rating_matrix <- rating_matrix %>% select(-User.ID)  #remove User.ID column
+
+#rating_matrix <- as.matrix(rating_matrix)
+
+#Check that we have same unique number as dimensions  
+sorted_names <- as.character(unlist(rating_matrix[, 1]))
+rating_matrix <- as.matrix(rating_matrix[, -1])
+row.names(rating_matrix) <- sorted_names %>% 
+  as.matrix()
+rating_matrix[is.na(rating_matrix)] <- 0 #replace all NA values with 0 in the rating matrix
+
+#dim(rating_matrix)
+#length(unique(data_reduced$User.ID))
+#length(unique(data_reduced$ISBN))
+
+save(rating_matrix, file = "data/matrix.RData")
+rm(sorted_names, top_books, top_users, ratings_users, rating_matrix)
+
+# Define function for cosine similarity
+cosine_sim <- function(a, b) {
+  crossprod(a, b) / sqrt(crossprod(a) * crossprod(b))
+}
+
+
+```
+
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+load("data/matrix.RData")
+total_elements <- prod(dim(rating_matrix))
+non_zero_elements <- sum(rating_matrix != 0) #number of non-zero elements
+sparsity_proportion <- non_zero_elements / total_elements #sparsity as the proportion of non-zero elements
+sparsity_percentage <- (total_elements - non_zero_elements) / total_elements * 100
+
+# Create a data frame for the table
+sparsity_metrics <- data.frame(
+  Metric = c("Total Elements", "Non-Zero Elements", "Sparsity Proportion", "Sparsity Percentage (%)"),
+   Value = c(format(total_elements, scientific = FALSE),
+             format(non_zero_elements, scientific = FALSE),
+             format(sparsity_proportion, scientific = FALSE),
+             format(sparsity_percentage, scientific = FALSE, digits = 4))
+)
+
+kable(sparsity_metrics, format = "markdown", caption = "Sparsity Metrics of the Rating Matrix")
+#cat("Total elements:", total_elements, "\n")
+#cat("Non-zero elements:", non_zero_elements, "\n")
+#cat("Sparsity proportion (non-zero):", sparsity_proportion, "\n")
+#cat("Sparsity percentage (zero elements):", sparsity_percentage, "%\n")
+
+```
+The sparsity metrics shown in Table 1.1 of the rating matrix reveal a significant level of emptiness within the data set with only 114,812 of these entries contain non-zero values. With the large number of users and books this type of sparsity is expected in in the data matrix. We attempt to deal with this sparsity by limiting further filtering the data where each row and column should have at least ten results. Table 1.2 shows the results of further filter but does not significantly reduce the sparsity percentage. This sparsity will pose significant challenges when constructing the recommenders. 
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+filter_matrix <- function(rating_matrix, threshold = 10) {
+  row_nonzero_count <- rowSums(rating_matrix != 0)
+  col_nonzero_count <- colSums(rating_matrix != 0)
+  filtered_rows <- rating_matrix[row_nonzero_count > threshold, ]
+  filtered_matrix <- filtered_rows[, col_nonzero_count > threshold]
+  return(filtered_matrix)
+}
+filtered_rating_matrix <- filter_matrix(rating_matrix, threshold = 10)
+
+total_elements <- prod(dim(filtered_rating_matrix))
+non_zero_elements <- sum(filtered_rating_matrix != 0) #number of non-zero elements
+sparsity_proportion <- non_zero_elements / total_elements #sparsity as the proportion of non-zero elements
+sparsity_percentage <- (total_elements - non_zero_elements) / total_elements * 100
+
+# Create a data frame for the table
+sparsity_metrics <- data.frame(
+  Metric = c("Total Elements", "Non-Zero Elements", "Sparsity Proportion", "Sparsity Percentage (%)"),
+   Value = c(format(total_elements, scientific = FALSE),
+             format(non_zero_elements, scientific = FALSE),
+             format(sparsity_proportion, scientific = FALSE),
+             format(sparsity_percentage, scientific = FALSE, digits = 4))
+)
+
+kable(sparsity_metrics, format = "markdown", caption = "Sparsity Metrics of the Rating Matrix")
+
+```
+Figure 1.3 illustrates the distribution of ratings by user from the usable data set with all implicit ratings removed. The distribution is skewed towards higher ratings and suggests that users tend to have a positive view of the books.
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+#load("data/reduced.RData")
+
+#p <- ggplot(data_reduced, aes(x = factor(data_reduced$rating))) +  
+# geom_bar(aes(y = ..count..), fill = "skyblue", color = "black", size = 0.2) +  
+##  labs(title = "Figure 1.3 - Distribution of Ratings",
+#      x = "Rating",
+#       y = "Count") + 
+#  theme_minimal()
+#ggsave("figures/distribution_of_ratings.png", plot = p, width = 8, height = 5, dpi = 300)
+#p
+```
+ ![Distribution of Ratings](figures/distribution_of_ratings.png)
+ 
+## Methods
+
+### Item-based Collaborative Filtering
+
+An item-based collaborative recommendation system is a model that focuses on identifying similarities between items (books) based on the user ratings we received. Item-based methods compare the products themselves, where the core idea is that if two items receive similar ratings from users, they are likely to be similar and could be recommended together. The main advantage of item-based collaborative filtering is that the items (books) generally receive more ratings over time, leading to more consistent similarity measures.
+
+In order to perform item-based CF, we first load and preprocess the ratings data by transposing the user-item rating matrix. Each item's rating vector is normalized using the L2 norm to account for variations in rating as this ensures a consistent scale when computing similarities.
+
+Cosine similarity is utilized as the measure of similarity between items. This is computed through matrix multiplication, where the dot product between item vectors is divided by the product of their norms. The diagonal of the resulting similarity matrix is set to zero since the similarity of an item with itself is not meaningful for recommendation purposes.
+
+We write an *item_based_recommendations* function then generates recommendations for a specific user by calculating the sum of similarities between items the user has rated and other items. Items that have not been rated by the user are sorted by their similarity scores, and the top 3 recommendations are returned. Item based recommendations are illustrated below in Table @secPlot1.
+
+```{r, echo= FALSE}
+#| echo: false
+#| warning: false
+#| message: false
+
+#Transpose the rated matrix
+load("data/matrix.RData")
+#rownames(rating_matrix)
+#colnames(rating_matrix)
+#dim(rating_matrix)
+# Function to reduce very large data set
+
+filter_matrix <- function(rating_matrix, threshold = 10) {
+  row_nonzero_count <- rowSums(rating_matrix != 0)
+  col_nonzero_count <- colSums(rating_matrix != 0)
+  filtered_rows <- rating_matrix[row_nonzero_count > threshold, ]
+  filtered_matrix <- filtered_rows[, col_nonzero_count > threshold]
+  return(filtered_matrix)
+}
+filtered_rating_matrix <- filter_matrix(rating_matrix, threshold = 10)
+#dim(filtered_rating_matrix)
+
+t.ratings <- t(filtered_rating_matrix)
+
+#dim(t.ratings)
+
+#small_subset <- t.ratings[1:100, 1:100];small_subset
+#t.small <- t(small_subset)
+#t.small
+#dim(small_subset)
+
+#Normalize each vector by its magnitude (L2 norm)
+normalize <- function(m) 
+{
+  sqrt(rowSums(m^2))
+}
+book_norms <- normalize(t.ratings)
+
+
+
+#Compute cosine similarity using matrix multiplication
+item_similarities <- (t.ratings %*% t(t.ratings)) / (book_norms %*% t(book_norms))
+diag(item_similarities) <- 0 # Set diagonal to zero (self-similarity is not needed)
+#Function to generate an item-based recommendation for any user
+item_based_recommendations <- function(user, book_sim, read) 
+  {
+  #user <- 243
+  #book_sim <- item_similarities
+  #read <- filtered_rating_matrix
+  number_of_books <- 3
+  
+  user <- ifelse(is.character(user), user, as.character(user))
+  #Scores
+  user_read <- row.names(book_sim)[read[user, ] > 0]
+  user_ratings <- tibble(
+    book = rownames(book_sim),
+    rating = apply(book_sim[, user_read], 1, sum),
+    seen = read[user, ]
+  )
+  #sort unseen movies by score and remove the 'seen' column
+  output <- user_ratings %>%
+    filter(seen == 0) %>%
+    arrange(desc(rating)) %>%
+    select(-seen)  %>%
+    slice_head(n = number_of_books)
+  
+  return(output)
+  
+}
+
+#dim(filtered_rating_matrix)
+#dim(t.ratings)
+#dim(item_similarities)
+
+# Recomedars of some users
+rec_1 <- item_based_recommendations(user = 243, book_sim = item_similarities, read = filtered_rating_matrix)
+
+rec_2 <- item_based_recommendations(user = 1733, book_sim = item_similarities, read = filtered_rating_matrix)
+
+rec_3 <- item_based_recommendations(user = 507, book_sim = item_similarities, read = filtered_rating_matrix)
+
+
+ratings_with_titles_1 <- rec_1 %>%
+  left_join(book_info %>% select(ISBN, Book.Title), by = c("book" = "ISBN"))
+
+ratings_with_titles_2<- rec_2 %>%
+  left_join(book_info %>% select(ISBN, Book.Title), by = c("book" = "ISBN"))
+
+ratings_with_titles_3 <- rec_3 %>%
+  left_join(book_info %>% select(ISBN, Book.Title), by = c("book" = "ISBN"))
+```
+
+
+```{r }
+#| echo: false
+#| warning: false
+#| message: false
+#| label: secPlot1
+ratings_with_titles_1 %>%
+  kable("markdown", caption = "Top 3 recommendations for User 243 based on Item CF")
+
+ratings_with_titles_2 %>%
+  kable("markdown", caption = "Top 3 recommendations for User 1733 based on Item CF")
+
+ratings_with_titles_3 %>%
+  kable("markdown", caption = "Top 3 recommendations for User 507 based on Item CF")
+
+```
+
+### User-based Collaborative Filtering
+
+Unlike item-based collaborative filtering, user-based collaborative filtering systems focus on finding similarities between users based on their preferences and ratings. Instead of comparing products, this method identifies users who have rated items in similar ways, under the assumption that users with similar preferences will like similar items. The user-user similarity can be leveraged to make personalized recommendations, suggesting items liked by other users that a given user hasn’t yet interacted with.
+
+We follow a similar process to the item-based CF mentioned previously with a few key differences. A function utilized the user similarity matrix to calculate weighted ratings for each book. This function uses a collaborative filtering mechanism, wherein the recommendations were generated based on the ratings provided by users with similar preferences. We prioritized books that the target user had not previously rated and examples are shown in the Table @secPlot2 below. 
+
+```{r, echo= FALSE}
+#| echo: false
+#| warning: false
+#| message: false
+
+
+load("data/matrix.RData")
+filter_matrix <- function(rating_matrix, threshold = 10) {
+  row_nonzero_count <- rowSums(rating_matrix != 0)
+  col_nonzero_count <- colSums(rating_matrix != 0)
+  filtered_rows <- rating_matrix[row_nonzero_count > threshold, ]
+  filtered_matrix <- filtered_rows[, col_nonzero_count > threshold]
+  return(filtered_matrix)
+}
+filtered_rating_matrix_users <- filter_matrix(rating_matrix, threshold = 10)
+
+#Normalize each vector by its magnitude (L2 norm)
+normalize <- function(m) 
+{
+  sqrt(rowSums(m^2))
+}
+user_norms <- normalize(filtered_rating_matrix_users)
+
+
+
+#Compute cosine similarity using matrix multiplication
+item_similarities_user <- (filtered_rating_matrix_users %*% t(filtered_rating_matrix_users)) / (user_norms %*% t(user_norms))
+diag(item_similarities_user) <- 0 # Set diagonal to zero (self-similarity is not needed)
+
+#user-based recommendations
+user_based_recommendations <- function(user, user_sim, ratings_matrix, number_of_books = 3) {
+  user <- as.character(user)
+  user_similarities <- user_sim[user, ]   #similarities of the target user with all other users
+  weighted_ratings <- colSums(sweep(ratings_matrix, 1, user_similarities, "*"), na.rm = TRUE) / sum(user_similarities, na.rm = TRUE)   #weighted ratings for all books
+  
+  user_ratings <- tibble(
+    book = colnames(ratings_matrix),
+    rating = weighted_ratings,
+    seen = ratings_matrix[user, ]
+  )
+  #sort unseen books by score and select top recommendations
+  output <- user_ratings %>%
+    filter(is.na(seen) | seen == 0) %>%
+    arrange(desc(rating)) %>%
+    select(-seen) %>%
+    slice_head(n = number_of_books)
+  
+  return(output)
+}
+
+# Recomedars of some users
+recU_1 <- user_based_recommendations(user = 243, user_sim = item_similarities_user, ratings_matrix = filtered_rating_matrix_users)
+
+recU_2 <- user_based_recommendations(user = 1733, user_sim = item_similarities_user, ratings_matrix = filtered_rating_matrix_users)
+
+recU_3 <- user_based_recommendations(user = 507, user_sim = item_similarities_user, ratings_matrix = filtered_rating_matrix_users)
+
+
+ratings_with_titles_1U <- recU_1 %>%
+  left_join(book_info %>% select(ISBN, Book.Title), by = c("book" = "ISBN"))
+
+ratings_with_titles_2U <- recU_2 %>%
+  left_join(book_info %>% select(ISBN, Book.Title), by = c("book" = "ISBN"))
+
+ratings_with_titles_3U <- recU_3 %>%
+  left_join(book_info %>% select(ISBN, Book.Title), by = c("book" = "ISBN"))
+```
+
+``` {r}
+#| echo: false
+#| warning: false
+#| message: false
+#| label: secPlot2
+ratings_with_titles_1U %>%
+  kable("markdown", caption = "Top 3 recommendations for User 243 based on User CF")
+
+ratings_with_titles_2U %>%
+  kable("markdown", caption = "Top 3 recommendations for User 1733 based on User CF")
+
+ratings_with_titles_3 %>%
+  kable("markdown", caption = "Top 3 recommendations for User 507 based on User CF")
+
+
+```
+
+### Matrix Factorization
+
+The matrix factorization approach was implemented using the recosystem package in R. As previously outlined, the data set was preprocessed by filtering users with at least 3 ratings and books with at least 10 ratings in an effort to reduce sparsity The data was split into training (80%) and test (20%) sets. 
+
+The recosystem model was tuned using a grid search over dimensions (10, 25, 50) and learning rates (0.1, 0.01), with 20 iterations. The model was then trained both with and without L2 regularization (lambda = 0.1). To assess model performance, Root Mean Square Error (RMSE) was calculated on the test set. Additionally, 5-fold cross-validation was performed to obtain a more robust estimate of model performance. Finally, the model was retrained using the optimal parameters found during tuning.
+
+```{r, echo= FALSE, message=FALSE, warning=FALSE}
+#| echo: false
+#| warning: false
+#| message: false
+
+load("data/ratings_users.RData")
+ratings_users <- ratings_users %>%
+  select(User.ID, ISBN, Book.Rating, Book.Title)
+
+# Reduce dataset size (user have 3 or more ratings) 5444 have more than 3 ratings 
+top_users <- ratings_users %>%
+  group_by(User.ID) %>%
+  summarise(rating_count = n()) %>%
+  filter(rating_count >= 3 ) %>%
+  pull(User.ID)
+# Reduce dataset size (books have 10 or more ratings) 20194 have more than 20 ratings
+top_books <- ratings_users %>%
+  group_by(ISBN) %>%
+  summarise(rating_count = n()) %>%
+  filter(rating_count >= 10) %>%
+  pull(ISBN)
+#reduce data set to only those we need
+data_reduced <- ratings_users %>%
+  filter(User.ID %in% top_users, ISBN %in% top_books)
+
+#unique user and book IDs
+unique_users <- unique(data_reduced$User.ID)
+unique_books <- unique(data_reduced$ISBN)
+
+#mapping for user IDs starting from 0
+user_mapping <- data.frame(original_id = unique_users, new_id = seq(0, length(unique_users) - 1))
+data_reduced <- data_reduced %>%
+  left_join(user_mapping, by = c("User.ID" = "original_id")) %>%
+  rename(user_id = new_id)
+
+#mapping for book IDs starting from 0
+book_mapping <- data.frame(original_id = unique_books, new_id = seq(0, length(unique_books) - 1))
+data_reduced <- data_reduced %>%
+  left_join(book_mapping, by = c("ISBN" = "original_id")) %>%
+  rename(book_id = new_id)
+
+data_reduced <- data_reduced %>%
+  select(user_id, book_id, Book.Rating) %>%
+  rename(rating = Book.Rating)
+
+
+set.seed(321)
+#sampled_data <- data_reduced[sample(nrow(data_reduced), 10000), ] # reduce size for testing 
+sampled_data <- data_reduced # reduce size for testing
+train_indices <- sample(seq_len(nrow(sampled_data)), size = 0.80 * nrow(sampled_data))
+train_data <- sampled_data[train_indices, ]
+test_data <- sampled_data[-train_indices, ]
+
+
+#Prepare data for recosystem - WITHOUT R
+train_set <- data_memory(train_data$user_id, train_data$book_id, train_data$rating)
+model <- Reco() # Initialize the model
+
+# train paramterd
+opts <- model$tune(train_set, opts = list(
+  dim = c(10, 25, 50),
+  lrate = c(0.1, 0.01),
+  niter = 20, 
+  nmf = TRUE, 
+  nthread = 4, 
+   verbose = FALSE
+))
+#opts
+
+#display the optimal parameters
+opts_df <- as.data.frame(opts$min)
+kable(opts_df, format = "markdown", caption = "Optimal Parameters for Matrix Factorization")
+
+model$train(train_set, opts = list(dim = 10, lrate = 0.05, niter = 20,  verbose = FALSE)) #train the model without regularization
+test_set <- data_memory(test_data$user_id, test_data$book_id) #predict ratings for the test set
+predictions <- model$predict(test_set)
+
+#Calculate RMSE for accuracy assessment
+rmse <- sqrt(mean((predictions - test_data$rating)^2))
+#print(paste("RMSE without regularization:", rmse))
+########################################################################################################
+model$train(train_set, opts = list(dim = 10, lrate = 0.05, niter = 20, costp_l2 = 0.1,  verbose = FALSE)) # Train the model with regularization (e.g., lambda = 0.1)
+predictions_reg <- model$predict(test_set) # Predict ratings for the test set again
+
+#RMSE with regularization
+rmse_reg <- sqrt(mean((predictions_reg - test_data$rating)^2))
+#print(paste("RMSE with regularization:", rmse_reg))
+
+
+# K fold cross validation
+k <- 5 #folds
+folds <- createFolds(train_data$rating, k = k)
+cv_rmse <- c()
+
+for (i in seq_along(folds)) {
+  invisible({
+    train_fold <- train_data[-folds[[i]], ]
+    val_fold <- train_data[folds[[i]], ]
+    train_set_fold <- data_memory(train_fold$user_id, train_fold$book_id, train_fold$rating)
+    model$train(train_set_fold, opts = list(dim = 10, lrate = 0.05, niter = 20,  verbose = FALSE))
+    val_set_fold <- data_memory(val_fold$user_id, val_fold$book_id)
+    predictions_fold <- model$predict(val_set_fold)
+    cv_rmse[i] <- sqrt(mean((predictions_fold - val_fold$rating)^2))})
+}
+
+mean_cv_rmse <- mean(cv_rmse)
+#print(paste("Mean CV RMSE:", mean_cv_rmse))
+ 
+# with optimal paramters. 
+
+model$train(train_set, opts = list(
+  opts$min,
+  niter = 20, 
+  nthread = 4,
+  verbose = FALSE
+))
+
+predictions_reg_opt <- model$predict(test_set) # Predict ratings for the test set again
+
+#RMSE with regularization
+rmse_opt <- sqrt(mean((predictions_reg_opt - test_data$rating)^2))
+
+model_results <- data.frame(
+  Model = c("Model without Regularization", "Model with Regularization", "Mean Cross-Validated RMSE", "RMSE using Tuned Paramters"),
+  RMSE = c(rmse, rmse_reg, mean_cv_rmse, rmse_opt),
+  Description = c(
+    "This model is evaluated without any regularization applied, which may lead to overfitting.",
+    "This model incorporates regularization to prevent overfitting and improve generalization.",
+    "This RMSE is derived from cross-validation, providing a more robust estimate of model performance.",
+    "This RMSE reflects the best performance obtained through hyperparameter optimization."
+  )
+)
+
+kable(model_results, format = "markdown", caption = "Model RMSE Result")
+
+
+users_to_predict <- data.frame(
+  user_id = c(19, 124, 333),
+  book_id = rep(unique_books, 
+                length.out = 3 * length(unique_books))
+)
+
+pred_set <- data_memory(users_to_predict$user_id, users_to_predict$book_id)
+predictions <- model$predict(pred_set)
+predicted_ratings <- users_to_predict %>%
+  mutate(predicted_rating = predictions)
+top_predictions <- predicted_ratings %>%
+  group_by(user_id) %>%
+  arrange(desc(predicted_rating)) %>%
+  slice_head(n = 5) # Change n to get more or fewer recommendations
+
+```
+
+The model without regularization achieved an RMSE of 1.66, while the regularized model slightly worse performance with an RMSE of 1.66. This suggests that regularization did not help mitigate over fitting. The cross-validated RMSE of 1.71 provides a more reliable estimate of the model's performance on unseen data. The model with tuned parameters achieved a lower performance, with an RMSE of 1.74.
+
+### Ensemble Model
+
+An ensemble approach combines predictions from multiple different models to generate a concensu views. This type of model attempts to draw strgeths from different model. Three recommender system models: item-based collaborative filtering (CF), user-based CF, and matrix factorization (MF) are used for the following ensemble model where with the weightings for each model as follows: 0.2 for item-based CF, 0.2 for user-based CF, and 0.6 for matrix factorization. The weights were chosen to balance the strengths matrix factorization with inputs from more simplistic models such as user and item based CF. The code for this section does unfortunately not run but the workings are provided in the file. 
+
+``` {r, eval = FALSE}
+#| echo: false
+#| warning: false
+#| message: false
+#| eval: false
+
+weight_item_based <- 0.2  # Weight for item-based CF
+weight_user_based <- 02   # Weight for user-based CF
+weight_mf <- 0.6           # Weight for matrix factorization
+
+#pred from item-based CF
+item_based_predictions <- item_based_recommendations(user = 507, book_sim = item_similarities, read = filtered_rating_matrix)
+#pred from user-based CF
+user_based_predictions <- user_based_recommendations(user = 507, user_sim = item_similarities_user, ratings_matrix = filtered_rating_matrix_users)
+
+#pred for mf
+user_id <- 507
+test_data_507 <- data.frame(user_id = user_id, book_id = unique_books)
+pred_set_507 <- data_memory(test_data_507$user_id, test_data_507$book_id)
+mf_predictions <- model$predict(pred_set_507)
+
+# Combine predictions with user ID and book ID
+predicted_ratings <- test_data %>%
+  mutate(predicted_rating = mf_predictions)
+
+# Display predicted ratings
+print(predicted_ratings)
+mf_predictions
+
+#combined_predictions <- data.frame(
+ # user_id = test_data$user_id,
+ # book_id = test_data$book_id,
+ # item_based = item_based_predictions,
+ # user_based = user_based_predictions,
+ # mf = mf_predictions
+)
+combined_predictions
+#ensemble predictions (simple average)
+combined_predictions$ensemble_prediction <- (
+  (combined_predictions$item_based * weight_item_based) +
+  (combined_predictions$user_based * weight_user_based) +
+  (combined_predictions$mf * weight_mf)
+)
+# Calculate RMSE for ensemble predictions
+ensemble_rmse <- sqrt(mean((combined_predictions$ensemble_prediction - test_data$rating)^2))
+#print(paste("Ensemble RMSE:", ensemble_rmse))
+
+```
+
+
+## Conclusions 
+
+An effective approach to building a recommender system would be to use an ensemble method that combine item-based collaborative filtering (CF), user-based CF, and matrix factorization. Item-based CF analyzes similarities between items based on user ratings, allowing for recommendations of similar books. User-based CF, on the other hand, identifies users with similar preferences to make personalized suggestions. Matrix factorization decomposes the user-item interaction matrix into latent factors, capturing hidden relationships between users and items. By integrating predictions from these three methods through weighted averaging—an ensemble model can enhance overall recommendation accuracy and provide more robust suggestions tailored to individual user preferences.
+
+## References
